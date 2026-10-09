@@ -3,8 +3,8 @@
 // Copyright(C) 2014 James M. Stone <jmstone@princeton.edu> and other code contributors
 // Licensed under the 3-clause BSD License, see LICENSE file for details
 //========================================================================================
-//! \file strat.cpp
-//! \brief Problem generator for stratified 3D shearing sheet.
+//! \file strat_slosh.cpp
+//! \brief Problem generator for stratified 3D shearing sheet with sloshing forcing.
 //!
 //! PURPOSE:  Problem generator for stratified 3D shearing sheet.  Based on the
 //!   initial conditions described in "Three-dimensional Magnetohydrodynamic
@@ -19,8 +19,15 @@
 //! - ifield = 5 - uniform By, but only for |z|<2
 //! - ifield = 6 - By with constant beta versus z
 //! - ifield = 7 - zero field everywhere
+//! - ifield = 8 - divergence-free random noise field (curl of random vector potential)
 //!
 //! - ipert = 1 - random perturbations to P and V [default, used by HGB]
+//! ~ iv    = 0 - keplerian velocity only
+//! ~ iv    = 1 - keplerian velocity + initial slosh mode velocity
+//!
+//! Sloshing forcing parameters:
+//! - psi   : forcing amplitude (dimensionless)
+//! - rise_t: exponential rise timescale; 0 = instantaneous onset [default]
 //!
 //! Code must be configured using -shear
 //!
@@ -34,11 +41,13 @@
 // C++ headers
 #include <algorithm>
 #include <cmath>      // sqrt()
+#include <functional> // hash
 #include <iostream>
 #include <limits>
 #include <sstream>    // stringstream
 #include <stdexcept>  // runtime_error
 #include <string>     // c_str()
+#include <random>
 
 // Athena++ headers
 #include "../athena.hpp"
@@ -56,7 +65,6 @@
 #include <mpi.h>
 #endif
 
-// TODO(felker): many unused arguments in these functions: time, iout, ...
 void VertGrav(MeshBlock *pmb, const Real time, const Real dt,
               const AthenaArray<Real> &prim, const AthenaArray<Real> &prim_scalar,
               const AthenaArray<Real> &bcc, AthenaArray<Real> &cons,
@@ -73,27 +81,33 @@ namespace {
 Real HistoryBxBy(MeshBlock *pmb, int iout);
 Real HistorydVxVy(MeshBlock *pmb, int iout);
 
-// Apply a density floor - useful for large |z| regions
 Real dfloor, pfloor;
-Real Omega_0, qshear, psi_f;
+Real Omega_0, qshear, psi_f, rise_t, Hbeta;
 } // namespace
 
 //====================================================================================
 void Mesh::InitUserMeshData(ParameterInput *pin) {
-  // shearing sheet parameter
   qshear = pin->GetReal("orbital_advection","qshear");
   Omega_0 = pin->GetReal("orbital_advection","Omega0");
   psi_f   = pin->GetReal("problem","psi");
+  rise_t  = pin->GetOrAddReal("problem","rise_t", 0.0);
+
+  Real beta_val = 0.0;
+  if (MAGNETIC_FIELDS_ENABLED) {
+    beta_val = pin->GetReal("problem","beta");
+    Hbeta = std::sqrt(1.0 + 1.0/beta_val);
+  } else {
+    Hbeta = 1.0;
+  }
 
   AllocateUserHistoryOutput(2);
-  EnrollUserHistoryOutput(0, HistoryBxBy, "-BxBy");
+  if (MAGNETIC_FIELDS_ENABLED) {
+    EnrollUserHistoryOutput(0, HistoryBxBy, "-BxBy");
+  }
   EnrollUserHistoryOutput(1, HistorydVxVy, "dVxVy");
 
-  // Enroll user-defined physical source terms
-  //   vertical external gravitational potential
   EnrollUserExplicitSourceFunction(VertGrav);
 
-  // enroll user-defined boundary conditions
   if (mesh_bcs[BoundaryFace::inner_x3] == GetBoundaryFlag("user")) {
     EnrollUserBoundaryFunction(BoundaryFace::inner_x3, StratOutflowInnerX3);
   }
@@ -103,7 +117,7 @@ void Mesh::InitUserMeshData(ParameterInput *pin) {
 
   if (!shear_periodic) {
     std::stringstream msg;
-    msg << "### FATAL ERROR in hb3.cpp ProblemGenerator" << std::endl
+    msg << "### FATAL ERROR in strat_slosh.cpp ProblemGenerator" << std::endl
         << "This problem generator requires shearing box." << std::endl;
     ATHENA_ERROR(msg);
   }
@@ -118,53 +132,39 @@ void Mesh::InitUserMeshData(ParameterInput *pin) {
 //  \brief stratified disk problem generator for 3D problems.
 //======================================================================================
 void MeshBlock::ProblemGenerator(ParameterInput *pin) {
-  int ifield, ipert;
+  int ifield, ipert, iv;
   Real beta, amp, pres;
   Real iso_cs=1.0;
   Real B0 = 0.0;
 
   Real SumRd=0.0, SumRvx=0.0, SumRvy=0.0, SumRvz=0.0;
-  // TODO(felker): tons of unused variables in this file: xmin, xmax, rbx, rby, Ly, ky,...
   Real x1, x3;
-  //Real xmin, xmax;
-  //Real x1f, x2f, x3f;
   Real rd(0.0), rp(0.0);
   Real rvx, rvy, rvz;
-  //Real rbx, rby, rbz;
   Real rval;
 
-  // initialize density
   const Real den=1.0;
 
-  // Initialize boxsize
   Real Lx = pmy_mesh->mesh_size.x1max - pmy_mesh->mesh_size.x1min;
-  //Real Ly = pmy_mesh->mesh_size.x2max - pmy_mesh->mesh_size.x2min;
-  //Real Lz = pmy_mesh->mesh_size.x3max - pmy_mesh->mesh_size.x3min;
+  Real Lz = pmy_mesh->mesh_size.x3max - pmy_mesh->mesh_size.x3min;
 
-  // initialize wavenumbers
   int nwx = pin->GetOrAddInteger("problem","nwx",1);
-  //int nwy = pin->GetOrAddInteger("problem","nwy",1);
-  //int nwz = pin->GetOrAddInteger("problem","nwz",1);
-  Real kx = (2.0*PI/Lx)*(static_cast<Real>(nwx));// nxw=-ve for leading wave
-  //Real ky = (2.0*PI/Ly)*(static_cast<Real>(nwy));
-  //Real kz = (2.0*PI/Lz)*(static_cast<Real>(nwz));
+  Real kx = (2.0*PI/Lx)*(static_cast<Real>(nwx));
 
-  // Ensure a different initial random seed for each meshblock.
   std::int64_t iseed = -1 - gid;
 
-  // adiabatic gamma
   Real gam = peos->GetGamma();
 
   if (pmy_mesh->mesh_size.nx3 == 1) {
     std::stringstream msg;
-    msg << "### FATAL ERROR in strat.cpp ProblemGenerator" << std::endl
+    msg << "### FATAL ERROR in strat_slosh.cpp ProblemGenerator" << std::endl
         << "Stratified shearing sheet only works on a 3D grid" << std::endl;
     ATHENA_ERROR(msg);
   }
 
-  // Read problem parameters for initial conditions
   amp = pin->GetReal("problem","amp");
   ipert = pin->GetOrAddInteger("problem","ipert", 1);
+  iv = pin->GetOrAddInteger("problem","iv", 0);
 
   Real float_min = std::numeric_limits<float>::min();
   dfloor=pin->GetOrAddReal("hydro","dfloor",(1024*(float_min)));
@@ -175,7 +175,6 @@ void MeshBlock::ProblemGenerator(ParameterInput *pin) {
     beta = pin->GetReal("problem","beta");
   }
 
-  // Compute pressure based on the EOS.
   if (NON_BAROTROPIC_EOS) {
     pres  = pin->GetOrAddReal("problem","pres",1.0);
   } else {
@@ -183,30 +182,73 @@ void MeshBlock::ProblemGenerator(ParameterInput *pin) {
     pres = den*SQR(iso_cs);
   }
 
-  // Compute field strength based on beta.
+  // Allocate vector potential arrays for ifield=8 (noise field)
+  int nx1 = block_size.nx1 + 2*NGHOST;
+  int nx2 = block_size.nx2 + 2*NGHOST;
+  int nx3 = block_size.nx3 + 2*NGHOST;
+  AthenaArray<Real> a1, a2, a3;
+  a1.NewAthenaArray(nx3, nx2, nx1);
+  a2.NewAthenaArray(nx3, nx2, nx1);
+  a3.NewAthenaArray(nx3, nx2, nx1);
+
   if (MAGNETIC_FIELDS_ENABLED) {
     B0 = std::sqrt(static_cast<Real>(2.0*pres/beta));
-    std::cout << "B0=" << B0 << std::endl;
+    if (ifield == 8) {
+      // Divergence-free noise field via curl of random vector potential.
+      // Use coordinate-based hashing so faces shared between meshblocks
+      // get identical vector potential values, ensuring div(B)=0 globally.
+      Real noise_amp = B0*std::pow(1.0/SQR(pcoord->dx1f(is))
+                                 + 1.0/SQR(pcoord->dx2f(js))
+                                 + 1.0/SQR(pcoord->dx3f(ks)), -0.5);
+      std::hash<double> hasher;
+      for (int k=ks; k<=ke+1; k++) {
+        for (int j=js; j<=je+1; j++) {
+          for (int i=is; i<=ie+1; i++) {
+            Real xf1 = pcoord->x1f(i);
+            Real xf2 = pcoord->x2f(j);
+            Real xf3 = pcoord->x3f(k);
+            Real xv1 = pcoord->x1v(i);
+            Real xv2 = pcoord->x2v(j);
+            Real xv3 = pcoord->x3v(k);
+            // A1 at (x1v, x2f, x3f)
+            if (i != ie+1) {
+              uint64_t s = hasher(xv1) ^ (hasher(xf2)*2654435761ULL)
+                         ^ (hasher(xf3)*40503ULL) ^ 1ULL;
+              std::mt19937 gen(s);
+              std::normal_distribution<> dist(0.0, noise_amp);
+              a1(k,j,i) = dist(gen);
+            }
+            // A2 at (x1f, x2v, x3f)
+            if (j != je+1) {
+              uint64_t s = hasher(xf1) ^ (hasher(xv2)*2654435761ULL)
+                         ^ (hasher(xf3)*40503ULL) ^ 2ULL;
+              std::mt19937 gen(s);
+              std::normal_distribution<> dist(0.0, noise_amp);
+              a2(k,j,i) = dist(gen);
+            }
+            // A3 at (x1f, x2f, x3v)
+            if (k != ke+1) {
+              uint64_t s = hasher(xf1) ^ (hasher(xf2)*2654435761ULL)
+                         ^ (hasher(xv3)*40503ULL) ^ 3ULL;
+              std::mt19937 gen(s);
+              std::normal_distribution<> dist(0.0, noise_amp);
+              a3(k,j,i) = dist(gen);
+            }
+          }
+        }
+      }
+    }
   }
 
-  // With viscosity and/or resistivity, read eta_Ohm and nu_V
-  // (to be filled in) ???
   for (int k=ks; k<=ke; k++) {
     for (int j=js; j<=je; j++) {
       for (int i=is; i<=ie; i++) {
         x1 = pcoord->x1v(i);
-        //x2 = pcoord->x2v(j);
         x3 = pcoord->x3v(k);
-        // x1f = pcoord->x1f(i);
-        // x2f = pcoord->x2f(j);
-        // x3f = pcoord->x3f(k);
 
-        // Initialize perturbations
-        // ipert = 1 - random perturbations to P/d and V
-        // [default, used by HGB]
         if (ipert == 1) {
           rval = amp*(ran2(&iseed) - 0.5);
-          rd = den*std::exp(-x3*x3)*(1.0+2.0*rval);
+          rd = den*std::exp(-x3*x3/(Hbeta*Hbeta))*(1.0+2.0*rval);
           if (rd < dfloor) rd = dfloor;
           SumRd += rd;
           if (NON_BAROTROPIC_EOS) {
@@ -224,16 +266,17 @@ void MeshBlock::ProblemGenerator(ParameterInput *pin) {
           rval = amp*(ran2(&iseed) - 0.5);
           rvz = (0.4/std::sqrt(3.0)) *rval*1e-3;
           SumRvz += rd*rvz;
-          // no perturbations
         } else {
-          rd = den*std::exp(-x3*x3);
+          rd = den*std::exp(-x3*x3/(Hbeta*Hbeta));
           rvx = 0;
           rvy = 0;
           rvz = 0;
         }
 
-        // Initialize d, M, and P.
-        // for_the_future: if FARGO do not initialize the bg shear
+        if (iv == 1) {
+          rvx += 0.01 * (psi_f/0.01) * iso_cs * std::sin(2*PI*x3/Lz);
+        }
+
         phydro->u(IDN,k,j,i) = rd;
         phydro->u(IM1,k,j,i) = rd*rvx;
         phydro->u(IM2,k,j,i) = rd*rvy;
@@ -245,17 +288,8 @@ void MeshBlock::ProblemGenerator(ParameterInput *pin) {
                                  + 0.5*(SQR(phydro->u(IM1,k,j,i))
                                         + SQR(phydro->u(IM2,k,j,i))
                                         + SQR(phydro->u(IM3,k,j,i)))/rd;
-        } // Hydro
+        }
 
-        // Initialize magnetic field.  For 3D shearing box B1=Bx, B2=By, B3=Bz
-        //  ifield = 1 - Bz=B0 std::sin(x1) field with zero-net-flux [default]
-        //  ifield = 2 - uniform Bz
-        //  ifield = 3 - Bz(1+0.5*sin(kx*x1))
-        //  ifield = 4 - B=(0,B0cos(kx*x1),B0sin(kx*x1)) =
-        //               zero-net flux w/ helicity
-        //  ifield = 5 - uniform By, but only for |z|<2
-        //  ifield = 6 - By with constant beta versus z
-        //  ifield = 7 - zero field everywhere
         if (MAGNETIC_FIELDS_ENABLED) {
           if (ifield == 1) {
             pfield->b.x1f(k,j,i) = 0.0;
@@ -299,23 +333,40 @@ void MeshBlock::ProblemGenerator(ParameterInput *pin) {
             if (k==ke) pfield->b.x3f(ke+1,j,i) = 0.0;
           }
           if (ifield == 6) {
-            // net toroidal field with constant \beta with height
+            // net toroidal field with constant beta with height
+            Real By_local = std::sqrt(2.0*pres/beta
+                            * std::exp(-x3*x3/(Hbeta*Hbeta)));
             pfield->b.x1f(k,j,i) = 0.0;
-            pfield->b.x2f(k,j,i) = std::sqrt(den*std::exp(-x3*x3)*SQR(Omega_0)/beta);
+            pfield->b.x2f(k,j,i) = By_local;
             pfield->b.x3f(k,j,i) = 0.0;
             if (i==ie) pfield->b.x1f(k,j,ie+1) = 0.0;
-            if (j==je) pfield->b.x2f(k,je+1,i) = std::sqrt(den*std::exp(-x3*x3)*
-                                                           SQR(Omega_0)/beta);
+            if (j==je) pfield->b.x2f(k,je+1,i) = By_local;
             if (k==ke) pfield->b.x3f(ke+1,j,i) = 0.0;
           }
           if (ifield == 7) {
-            // zero field everywhere
             pfield->b.x1f(k,j,i) = 0.0;
             pfield->b.x2f(k,j,i) = 0.0;
             pfield->b.x3f(k,j,i) = 0.0;
             if (i==ie) pfield->b.x1f(k,j,ie+1) = 0.0;
             if (j==je) pfield->b.x2f(k,je+1,i) = 0.0;
             if (k==ke) pfield->b.x3f(ke+1,j,i) = 0.0;
+          }
+          if (ifield == 8) {
+            pfield->b.x1f(k,j,i) = (a3(k  ,j+1,i) - a3(k,j,i))/pcoord->dx2f(j) -
+                                   (a2(k+1,j  ,i) - a2(k,j,i))/pcoord->dx3f(k);
+            pfield->b.x2f(k,j,i) = (a1(k+1,j,i  ) - a1(k,j,i))/pcoord->dx3f(k) -
+                                   (a3(k  ,j,i+1) - a3(k,j,i))/pcoord->dx1f(i);
+            pfield->b.x3f(k,j,i) = (a2(k,j  ,i+1) - a2(k,j,i))/pcoord->dx1f(i) -
+                                   (a1(k,j+1,i  ) - a1(k,j,i))/pcoord->dx2f(j);
+            if (i==ie) pfield->b.x1f(k,j,ie+1) =
+                (a3(k,j+1,ie+1) - a3(k,j,ie+1))/pcoord->dx2f(j) -
+                (a2(k+1,j,ie+1) - a2(k,j,ie+1))/pcoord->dx3f(k);
+            if (j==je) pfield->b.x2f(k,je+1,i) =
+                (a1(k+1,je+1,i) - a1(k,je+1,i))/pcoord->dx3f(k) -
+                (a3(k,je+1,i+1) - a3(k,je+1,i))/pcoord->dx1f(i);
+            if (k==ke) pfield->b.x3f(ke+1,j,i) =
+                (a2(ke+1,j,i+1) - a2(ke+1,j,i))/pcoord->dx1f(i) -
+                (a1(ke+1,j+1,i) - a1(ke+1,j,i))/pcoord->dx2f(j);
           }
         } // MHD
       }
@@ -324,7 +375,6 @@ void MeshBlock::ProblemGenerator(ParameterInput *pin) {
 
   // For random perturbations as in HGB, ensure net momentum is zero by
   // subtracting off mean of perturbations
-
   if (ipert == 1) {
     if (lid == pmy_mesh->nblocal - 1) {
 #ifdef MPI_PARALLEL
@@ -397,28 +447,32 @@ void VertGrav(MeshBlock *pmb, const Real time, const Real dt,
   Real z0 = Lz/2.0;
   Real lambda = 0.1 / z0;
   Real fw_x;
-  Real H=1; // assume scale height = 1
+  Real rise_envelope = (rise_t > 0.0) ? (1.0 - std::exp(-time/rise_t)) : 1.0;
   for (int k=pmb->ks; k<=pmb->ke; ++k) {
     for (int j=pmb->js; j<=pmb->je; ++j) {
       for (int i=pmb->is; i<=pmb->ie; ++i) {
         Real den = prim(IDN,k,j,i);
         Real x3 = pmb->pcoord->x3v(k);
-        // smoothing function
-        if (x3 >= 0) {
-          sign = -1.0;
-        } else {
-          sign = 1.0;
+
+        // Vertical gravity with smoothing near boundaries
+        if (std::abs(x3) > 1e-15) {
+          if (x3 >= 0) {
+            sign = -1.0;
+          } else {
+            sign = 1.0;
+          }
+          xi = z0/x3;
+          fsmooth = SQR( std::sqrt( SQR(xi+sign) + SQR(xi*lambda) ) + xi*sign );
+          cons(IM3,k,j,i) -= dt*den*SQR(Omega_0)*x3*fsmooth;
+          if (NON_BAROTROPIC_EOS) {
+            cons(IEN,k,j,i) -= dt*den*SQR(Omega_0)*prim(IVZ,k,j,i)*x3*fsmooth;
+          }
         }
-        xi = z0/x3;
-        fsmooth = SQR( std::sqrt( SQR(xi+sign) + SQR(xi*lambda) ) + xi*sign );
-        // multiply gravitational potential by smoothing function
-        cons(IM3,k,j,i) -= dt*den*SQR(Omega_0)*x3*fsmooth;
-        if (NON_BAROTROPIC_EOS) {
-          cons(IEN,k,j,i) -= dt*den*SQR(Omega_0)*prim(IVZ,k,j,i)*x3*fsmooth;
-        }
-	fw_x = den * std::pow(Omega_0,2.)*H*psi_f*std::sin(2*PI*x3/Lz)*std::cos(Omega_0*time);//
-	// NK: add forcing to radial momentum
-	cons(IM1,k,j,i) += dt*fw_x;
+
+        // Sloshing forcing
+        fw_x = den * SQR(Omega_0)*Hbeta*psi_f*rise_envelope
+               *std::sin(2*PI*x3/Lz)*std::cos(Omega_0*time);
+        cons(IM1,k,j,i) += dt*fw_x;
       }
     }
   }
@@ -439,8 +493,6 @@ void StratOutflowInnerX3(MeshBlock *pmb, Coordinates *pco,
                          AthenaArray<Real> &prim, FaceField &b,
                          Real time, Real dt,
                          int il, int iu, int jl, int ju, int kl, int ku, int ngh) {
-  // Copy field components from last physical zone
-  // zero slope boundary for B field
   if (MAGNETIC_FIELDS_ENABLED) {
     for (int k=1; k<=ngh; k++) {
       for (int j=jl; j<=ju; j++) {
@@ -471,23 +523,17 @@ void StratOutflowInnerX3(MeshBlock *pmb, Coordinates *pco,
         Real x3 = pco->x3v(kl-k);
         Real x3b = pco->x3v(kl);
         Real den = prim(IDN,kl,j,i);
-        // First calculate the effective gas temperature (Tkl=cs^2)
-        // in the last physical zone. If isothermal, use H=1
         Real Tkl = 0.5*SQR(Omega_0);
         if (NON_BAROTROPIC_EOS) {
           Real presskl = prim(IPR,kl,j,i);
           presskl = std::max(presskl,pfloor);
           Tkl = presskl/den;
         }
-        // Now extrapolate the density to balance gravity
-        // assuming a constant temperature in the ghost zones
+        // Extrapolate density using the magnetic scale height
         prim(IDN,kl-k,j,i) = den*std::exp(-(SQR(x3)-SQR(x3b))/
-                                          (2.0*Tkl/SQR(Omega_0)));
-        // Copy the velocities, but not the momenta ---
-        // important because of the density extrapolation above
+                                          (Hbeta*Hbeta));
         prim(IVX,kl-k,j,i) = prim(IVX,kl,j,i);
         prim(IVY,kl-k,j,i) = prim(IVY,kl,j,i);
-        // If there's inflow into the grid, set the normal velocity to zero
         if (prim(IVZ,kl,j,i) >= 0.0) {
           prim(IVZ,kl-k,j,i) = 0.0;
         } else {
@@ -502,19 +548,10 @@ void StratOutflowInnerX3(MeshBlock *pmb, Coordinates *pco,
 }
 
 // Here is the upper z outflow boundary.
-// The basic idea is that the pressure and density
-// are exponentially extrapolated in the ghost zones
-// assuming a constant temperature there (i.e., an
-// isothermal atmosphere). The z velocity (NOT the
-// momentum) are set to zero in the ghost zones in the
-// case of the last upper physical zone having an inward
-// flow.  All other variables are extrapolated into the
-// ghost zones with zero slope.
 void StratOutflowOuterX3(MeshBlock *pmb, Coordinates *pco,
                          AthenaArray<Real> &prim,
                          FaceField &b, Real time, Real dt,
                          int il, int iu, int jl, int ju, int kl, int ku, int ngh) {
-  // Copy field components from last physical zone
   if (MAGNETIC_FIELDS_ENABLED) {
     for (int k=1; k<=ngh; k++) {
       for (int j=jl; j<=ju; j++) {
@@ -545,23 +582,17 @@ void StratOutflowOuterX3(MeshBlock *pmb, Coordinates *pco,
         Real x3 = pco->x3v(ku+k);
         Real x3b = pco->x3v(ku);
         Real den = prim(IDN,ku,j,i);
-        // First calculate the effective gas temperature (Tku=cs^2)
-        // in the last physical zone. If isothermal, use H=1
         Real Tku = 0.5*SQR(Omega_0);
         if (NON_BAROTROPIC_EOS) {
           Real pressku = prim(IPR,ku,j,i);
           pressku = std::max(pressku,pfloor);
           Tku = pressku/den;
         }
-        // Now extrapolate the density to balance gravity
-        // assuming a constant temperature in the ghost zones
+        // Extrapolate density using the magnetic scale height
         prim(IDN,ku+k,j,i) = den*std::exp(-(SQR(x3)-SQR(x3b))/
-                                          (2.0*Tku/SQR(Omega_0)));
-        // Copy the velocities, but not the momenta ---
-        // important because of the density extrapolation above
+                                          (Hbeta*Hbeta));
         prim(IVX,ku+k,j,i) = prim(IVX,ku,j,i);
         prim(IVY,ku+k,j,i) = prim(IVY,ku,j,i);
-        // If there's inflow into the grid, set the normal velocity to zero
         if (prim(IVZ,ku,j,i) <= 0.0) {
           prim(IVZ,ku+k,j,i) = 0.0;
         } else {
@@ -581,8 +612,7 @@ Real HistoryBxBy(MeshBlock *pmb, int iout) {
   Real bxby = 0;
   int is = pmb->is, ie = pmb->ie, js = pmb->js, je = pmb->je, ks = pmb->ks, ke = pmb->ke;
   AthenaArray<Real> &b = pmb->pfield->bcc;
-  AthenaArray<Real> volume; // 1D array of volumes
-  // allocate 1D array for cell volume used in usr def history
+  AthenaArray<Real> volume;
   volume.NewAthenaArray(pmb->ncells1);
 
   for (int k=ks; k<=ke; k++) {
@@ -596,14 +626,12 @@ Real HistoryBxBy(MeshBlock *pmb, int iout) {
   return bxby;
 }
 
-
 Real HistorydVxVy(MeshBlock *pmb, int iout) {
   Real dvxvy = 0.0;
   int is = pmb->is, ie = pmb->ie, js = pmb->js, je = pmb->je, ks = pmb->ks, ke = pmb->ke;
   AthenaArray<Real> &w = pmb->phydro->w;
   Real vshear = 0.0;
-  AthenaArray<Real> volume; // 1D array of volumes
-  // allocate 1D array for cell volume used in usr def history
+  AthenaArray<Real> volume;
   volume.NewAthenaArray(pmb->ncells1);
 
   for (int k=ks; k<=ke; k++) {
